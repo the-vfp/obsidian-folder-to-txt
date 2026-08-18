@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS = {
   indexIncludeWordCount: false,
   indexIncludeModified: false,
   indexIncludeNonMarkdown: false,
+  indexSkipEmptyFolders: true,
   indexMaxDepth: 0, // 0 = no limit
   indexWriteFile: true,
   indexCopyToClipboard: true,
@@ -132,12 +133,44 @@ function compareEntries(a, b) {
   return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
 }
 
-function countDescendants(folder, settings) {
+// Memoised so a whole-vault walk stays linear rather than re-counting subtrees.
+function countIndexableFiles(folder, settings, memo) {
+  const cached = memo.get(folder.path);
+  if (cached !== undefined) return cached;
   let n = 0;
   for (const child of folder.children) {
-    if (!isIndexable(child, settings)) continue;
+    if (child instanceof TFolder) n += countIndexableFiles(child, settings, memo);
+    else if (isIndexable(child, settings)) n++;
+  }
+  memo.set(folder.path, n);
+  return n;
+}
+
+// A vault full of node_modules would otherwise bury the notes in empty branches.
+function isVisible(entry, settings, memo) {
+  if (!isIndexable(entry, settings)) return false;
+  if (entry instanceof TFolder && settings.indexSkipEmptyFolders) {
+    return countIndexableFiles(entry, settings, memo) > 0;
+  }
+  return true;
+}
+
+// Every folder inside a pruned branch, so the summary can report what was left out.
+function countAllFolders(folder) {
+  if (!(folder instanceof TFolder)) return 0;
+  let n = 0;
+  for (const child of folder.children) {
+    if (child instanceof TFolder) n += 1 + countAllFolders(child);
+  }
+  return n;
+}
+
+function countDescendants(folder, settings, memo) {
+  let n = 0;
+  for (const child of folder.children) {
+    if (!isVisible(child, settings, memo)) continue;
     n++;
-    if (child instanceof TFolder) n += countDescendants(child, settings);
+    if (child instanceof TFolder) n += countDescendants(child, settings, memo);
   }
   return n;
 }
@@ -177,7 +210,8 @@ function formatDate(ms) {
 
 async function buildIndex(app, folder, settings, onProgress) {
   const lines = [];
-  const stats = { notes: 0, folders: 0, hidden: 0 };
+  const stats = { notes: 0, folders: 0, hidden: 0, pruned: 0 };
+  const memo = new Map();
   const needsContent = settings.indexIncludeGist || settings.indexIncludeWordCount;
   const limit = Math.max(20, Number(settings.indexGistLength) || 120);
   let seen = 0;
@@ -214,7 +248,11 @@ async function buildIndex(app, folder, settings, onProgress) {
   }
 
   async function walk(current, prefix, depth) {
-    const visible = current.children.filter((c) => isIndexable(c, settings)).sort(compareEntries);
+    const indexable = current.children.filter((c) => isIndexable(c, settings));
+    const visible = indexable.filter((c) => isVisible(c, settings, memo)).sort(compareEntries);
+    for (const dropped of indexable) {
+      if (!visible.includes(dropped)) stats.pruned += 1 + countAllFolders(dropped);
+    }
 
     for (let i = 0; i < visible.length; i++) {
       const child = visible[i];
@@ -226,7 +264,7 @@ async function buildIndex(app, folder, settings, onProgress) {
         stats.folders++;
         lines.push(branch + child.name + '/');
         if (settings.indexMaxDepth > 0 && depth + 1 >= settings.indexMaxDepth) {
-          const n = countDescendants(child, settings);
+          const n = countDescendants(child, settings, memo);
           if (n) {
             lines.push(childPrefix + '… ' + n + ' more item' + (n === 1 ? '' : 's'));
             stats.hidden += n;
@@ -254,6 +292,7 @@ async function buildIndex(app, folder, settings, onProgress) {
     'generated ' + formatDate(Date.now()),
   ];
   if (stats.hidden) summary.splice(2, 0, stats.hidden + ' hidden by depth limit');
+  if (stats.pruned) summary.splice(2, 0, stats.pruned + ' empty folders skipped');
 
   const text = [
     '# Index of ' + rootName,
@@ -593,6 +632,7 @@ class FolderToTxtSettingTab extends PluginSettingTab {
     this.toggle('indexIncludeWordCount', 'Include word counts', 'Word count per note.');
     this.toggle('indexIncludeModified', 'Include last modified date', 'The date each note was last changed.');
     this.toggle('indexIncludeNonMarkdown', 'Include non-markdown files', 'List attachments, canvases and everything else, not just notes.');
+    this.toggle('indexSkipEmptyFolders', 'Skip folders with no notes', 'Leaves out branches that contain nothing indexable — node_modules and the like. The summary line reports how many were dropped.');
 
     new Setting(containerEl)
       .setName('Depth limit')

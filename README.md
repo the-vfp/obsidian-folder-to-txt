@@ -67,8 +67,27 @@ By default the index goes to your clipboard *and* to `<folder> index.md` in the 
 folder; either half can be switched off. Tags, word counts and modified dates are
 available but off by default, since they cost tokens without helping an assistant much.
 
+Folders containing nothing indexable are skipped by default — if a vault has a
+`node_modules` tree in it, you don't want 3,000 empty branches in the index. The
+summary line reports how many were dropped, so nothing vanishes quietly.
+
 Set a depth limit to keep large vaults manageable — folders past the limit collapse to
 a `… 47 more items` line rather than disappearing silently.
+
+### Size
+
+Indexes get big before you expect them to. Measured on a 5,800-note vault:
+
+| Settings | Size | Roughly |
+| --- | --- | --- |
+| Defaults, whole vault | 466 KB | 116k tokens |
+| Names only, whole vault | 299 KB | 75k tokens |
+| Defaults, depth 4 | 227 KB | 57k tokens |
+| Defaults, depth 3 | 58 KB | 15k tokens |
+
+A whole vault rarely fits in a chat window. A depth limit of 3 or 4 for the overall
+shape, plus a full index of the one folder you're actually working in, tends to be the
+usable combination.
 
 Only `.md` files are exported — attachments, canvases and other file types are skipped.
 If two notes in one folder reduce to the same filename after sanitising (`A: B` and
@@ -94,6 +113,7 @@ If two notes in one folder reduce to the same filename after sanitising (`A: B` 
 | Include word counts | off | Word count per note. |
 | Include last modified date | off | The date each note was last changed. |
 | Include non-markdown files | off | Lists attachments and canvases too, not just notes. |
+| Skip folders with no notes | on | Leaves out branches containing nothing indexable. |
 | Depth limit | 0 | Folder levels to show; 0 is unlimited. |
 
 Settings are per-vault, stored in `data.json` next to the plugin.
