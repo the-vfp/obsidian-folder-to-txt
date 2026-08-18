@@ -1,7 +1,7 @@
 'use strict';
 
 const obsidian = require('obsidian');
-const { Plugin, PluginSettingTab, Setting, Notice, FuzzySuggestModal, TFolder, TFile } = obsidian;
+const { Plugin, PluginSettingTab, Setting, Notice, FuzzySuggestModal, TFolder, TFile, getAllTags } = obsidian;
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -15,6 +15,17 @@ const DEFAULT_SETTINGS = {
   addTitleHeader: false,
   overwrite: true,
   windowsLineEndings: false,
+
+  // index export
+  indexIncludeGist: true,
+  indexGistLength: 120,
+  indexIncludeTags: false,
+  indexIncludeWordCount: false,
+  indexIncludeModified: false,
+  indexIncludeNonMarkdown: false,
+  indexMaxDepth: 0, // 0 = no limit
+  indexWriteFile: true,
+  indexCopyToClipboard: true,
 };
 
 /* ------------------------------------------------------------------ */
@@ -105,6 +116,176 @@ function collectMarkdown(folder, out) {
 }
 
 /* ------------------------------------------------------------------ */
+/* index export                                                        */
+/* ------------------------------------------------------------------ */
+
+function isIndexable(entry, settings) {
+  if (entry instanceof TFolder) return true;
+  return settings.indexIncludeNonMarkdown || entry.extension === 'md';
+}
+
+// Folders first, then files — matching the file explorer's own ordering.
+function compareEntries(a, b) {
+  const aFolder = a instanceof TFolder;
+  const bFolder = b instanceof TFolder;
+  if (aFolder !== bFolder) return aFolder ? -1 : 1;
+  return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function countDescendants(folder, settings) {
+  let n = 0;
+  for (const child of folder.children) {
+    if (!isIndexable(child, settings)) continue;
+    n++;
+    if (child instanceof TFolder) n += countDescendants(child, settings);
+  }
+  return n;
+}
+
+// One-line summary: the frontmatter description if there is one, else the first
+// real line of prose, flattened so markdown syntax doesn't leak into the index.
+function buildGist(raw, frontmatter, limit) {
+  let text = '';
+  if (frontmatter) {
+    const field = frontmatter.description || frontmatter.summary || frontmatter.subtitle;
+    if (typeof field === 'string' && field.trim()) text = field.trim();
+  }
+  if (!text) {
+    const body = flattenMarkdown(unwrapWikilinks(removeFrontmatter(raw).slice(0, 4000), true));
+    const line = body.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
+    text = line || '';
+  }
+  if (!text) return '';
+  text = text.replace(/\s+/g, ' ').trim();
+  if (text.length <= limit) return text;
+  const cut = text.slice(0, limit);
+  const space = cut.lastIndexOf(' ');
+  return (space > limit * 0.6 ? cut.slice(0, space) : cut).trimEnd() + '…';
+}
+
+function countWords(raw) {
+  const body = removeFrontmatter(raw).trim();
+  if (!body) return 0;
+  return body.split(/\s+/).length;
+}
+
+function formatDate(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+async function buildIndex(app, folder, settings, onProgress) {
+  const lines = [];
+  const stats = { notes: 0, folders: 0, hidden: 0 };
+  const needsContent = settings.indexIncludeGist || settings.indexIncludeWordCount;
+  const limit = Math.max(20, Number(settings.indexGistLength) || 120);
+  let seen = 0;
+
+  async function annotate(file) {
+    const parts = [];
+    let raw = null;
+    if (needsContent && file.extension === 'md') {
+      try {
+        raw = await app.vault.cachedRead(file);
+      } catch (err) {
+        console.error('[folder-to-txt] could not read ' + file.path, err);
+      }
+    }
+
+    const cache = app.metadataCache.getFileCache(file);
+    if (settings.indexIncludeGist && raw !== null) {
+      const gist = buildGist(raw, cache && cache.frontmatter, limit);
+      // Notes that open with an H1 of their own title would otherwise just echo it.
+      const echoesTitle = gist.trim().toLowerCase() === file.basename.trim().toLowerCase();
+      if (gist && !echoesTitle) parts.push('— ' + gist);
+    }
+    if (settings.indexIncludeTags && cache) {
+      const tags = getAllTags ? getAllTags(cache) : null;
+      if (tags && tags.length) parts.push('· ' + Array.from(new Set(tags)).join(' '));
+    }
+    if (settings.indexIncludeWordCount && raw !== null) {
+      parts.push('· ' + countWords(raw) + 'w');
+    }
+    if (settings.indexIncludeModified && file.stat) {
+      parts.push('· ' + formatDate(file.stat.mtime));
+    }
+    return parts.length ? ' ' + parts.join('  ') : '';
+  }
+
+  async function walk(current, prefix, depth) {
+    const visible = current.children.filter((c) => isIndexable(c, settings)).sort(compareEntries);
+
+    for (let i = 0; i < visible.length; i++) {
+      const child = visible[i];
+      const last = i === visible.length - 1;
+      const branch = prefix + (last ? '└── ' : '├── ');
+      const childPrefix = prefix + (last ? '    ' : '│   ');
+
+      if (child instanceof TFolder) {
+        stats.folders++;
+        lines.push(branch + child.name + '/');
+        if (settings.indexMaxDepth > 0 && depth + 1 >= settings.indexMaxDepth) {
+          const n = countDescendants(child, settings);
+          if (n) {
+            lines.push(childPrefix + '… ' + n + ' more item' + (n === 1 ? '' : 's'));
+            stats.hidden += n;
+          }
+        } else {
+          await walk(child, childPrefix, depth + 1);
+        }
+      } else {
+        stats.notes++;
+        lines.push(branch + child.name + (await annotate(child)));
+        if (++seen % 50 === 0 && onProgress) {
+          onProgress(seen);
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+    }
+  }
+
+  await walk(folder, '', 0);
+
+  const rootName = folder.isRoot() ? app.vault.getName() : folder.name;
+  const summary = [
+    stats.notes + ' file' + (stats.notes === 1 ? '' : 's'),
+    stats.folders + ' folder' + (stats.folders === 1 ? '' : 's'),
+    'generated ' + formatDate(Date.now()),
+  ];
+  if (stats.hidden) summary.splice(2, 0, stats.hidden + ' hidden by depth limit');
+
+  const text = [
+    '# Index of ' + rootName,
+    '',
+    summary.join(' · '),
+    '',
+    '```text',
+    rootName + '/',
+    ...lines,
+    '```',
+    '',
+  ].join('\n');
+
+  return { text, stats };
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (err) {
+    try {
+      require('electron').clipboard.writeText(text);
+      return true;
+    } catch (err2) {
+      console.error('[folder-to-txt] clipboard unavailable', err, err2);
+      return false;
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* plugin                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -142,6 +323,18 @@ module.exports = class FolderToTxtPlugin extends Plugin {
       callback: () => this.exportFolder(this.app.vault.getRoot()),
     });
 
+    this.addCommand({
+      id: 'export-folder-index',
+      name: 'Export an index of a folder',
+      callback: () => new FolderSuggestModal(this.app, (f) => this.exportIndex(f)).open(),
+    });
+
+    this.addCommand({
+      id: 'export-vault-index',
+      name: 'Export an index of the whole vault',
+      callback: () => this.exportIndex(this.app.vault.getRoot()),
+    });
+
     this.registerEvent(
       this.app.workspace.on('file-menu', (menu, file) => {
         if (file instanceof TFolder) {
@@ -150,6 +343,12 @@ module.exports = class FolderToTxtPlugin extends Plugin {
               .setTitle('Export folder as .txt')
               .setIcon('file-text')
               .onClick(() => this.exportFolder(file))
+          );
+          menu.addItem((item) =>
+            item
+              .setTitle('Export index of folder')
+              .setIcon('list-tree')
+              .onClick(() => this.exportIndex(file))
           );
         } else if (file instanceof TFile && file.extension === 'md') {
           menu.addItem((item) =>
@@ -173,6 +372,60 @@ module.exports = class FolderToTxtPlugin extends Plugin {
     const files = collectMarkdown(folder, []);
     const label = folder.isRoot() ? this.app.vault.getName() : folder.name;
     await this.exportFiles(files, folder, label);
+  }
+
+  async exportIndex(folder) {
+    const settings = this.settings;
+
+    if (!settings.indexWriteFile && !settings.indexCopyToClipboard) {
+      new Notice('Folder to TXT: the index has nowhere to go — enable the file or the clipboard in settings.', 9000);
+      return;
+    }
+    if (settings.indexWriteFile && !settings.outputPath) {
+      new Notice('Folder to TXT: set an output folder in the plugin settings first.', 8000);
+      return;
+    }
+
+    const notice = new Notice('Building index…', 0);
+    let result;
+    try {
+      result = await buildIndex(this.app, folder, settings, (n) =>
+        notice.setMessage('Building index… ' + n + ' files')
+      );
+    } catch (err) {
+      notice.hide();
+      new Notice('Folder to TXT: index failed — ' + err.message, 10000);
+      console.error('[folder-to-txt]', err);
+      return;
+    }
+    notice.hide();
+
+    const done = [];
+
+    if (settings.indexWriteFile) {
+      const label = folder.isRoot() ? this.app.vault.getName() : folder.name;
+      const target = path.join(settings.outputPath, safeSegment(label + ' index') + '.md');
+      try {
+        await fsp.mkdir(settings.outputPath, { recursive: true });
+        const body = settings.windowsLineEndings ? result.text.replace(/\n/g, '\r\n') : result.text;
+        await fsp.writeFile(target, body, 'utf8');
+        done.push('Written to ' + target);
+      } catch (err) {
+        done.push('Could not write the file — ' + err.message);
+        console.error('[folder-to-txt]', err);
+      }
+    }
+
+    if (settings.indexCopyToClipboard) {
+      done.push((await copyToClipboard(result.text)) ? 'Copied to clipboard' : 'Clipboard unavailable');
+    }
+
+    new Notice(
+      'Indexed ' + result.stats.notes + ' file' + (result.stats.notes === 1 ? '' : 's') +
+        ' in ' + result.stats.folders + ' folder' + (result.stats.folders === 1 ? '' : 's') +
+        '\n' + done.join('\n'),
+      12000
+    );
   }
 
   // `base` is the vault folder that becomes the root of the mirrored tree.
@@ -311,6 +564,49 @@ class FolderToTxtSettingTab extends PluginSettingTab {
 
     this.toggle('overwrite', 'Overwrite existing files', 'Turn off to skip any .txt that already exists at the destination.');
     this.toggle('windowsLineEndings', 'Use Windows line endings', 'Write CRLF instead of LF, for older editors like Notepad.');
+
+    new Setting(containerEl)
+      .setName('Index export')
+      .setDesc('A single file listing the folder tree — a structural snapshot to hand to an AI assistant without uploading the notes themselves.')
+      .setHeading();
+
+    this.toggle('indexCopyToClipboard', 'Copy the index to the clipboard', 'Ready to paste straight into a chat.');
+    this.toggle('indexWriteFile', 'Also write it to a file', 'Saves "<folder> index.md" in the output folder above.');
+
+    this.toggle('indexIncludeGist', 'Include a one-line gist', 'The frontmatter description if a note has one, otherwise its first line of prose.');
+
+    new Setting(containerEl)
+      .setName('Gist length')
+      .setDesc('Characters before the gist is truncated. Lower it to keep large indexes manageable.')
+      .addSlider((s) =>
+        s
+          .setLimits(40, 300, 10)
+          .setValue(Number(this.plugin.settings.indexGistLength) || 120)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.indexGistLength = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    this.toggle('indexIncludeTags', 'Include tags', 'Every tag on the note, frontmatter and inline.');
+    this.toggle('indexIncludeWordCount', 'Include word counts', 'Word count per note.');
+    this.toggle('indexIncludeModified', 'Include last modified date', 'The date each note was last changed.');
+    this.toggle('indexIncludeNonMarkdown', 'Include non-markdown files', 'List attachments, canvases and everything else, not just notes.');
+
+    new Setting(containerEl)
+      .setName('Depth limit')
+      .setDesc('How many folder levels to show. 0 means no limit; deeper folders are summarised as a count.')
+      .addSlider((s) =>
+        s
+          .setLimits(0, 10, 1)
+          .setValue(Number(this.plugin.settings.indexMaxDepth) || 0)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.indexMaxDepth = v;
+            await this.plugin.saveSettings();
+          })
+      );
   }
 }
 
