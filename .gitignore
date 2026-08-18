@@ -1,0 +1,7 @@
+# Obsidian writes per-vault plugin settings here — never commit them
+data.json
+
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

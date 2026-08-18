@@ -1,0 +1,10 @@
+{
+  "id": "folder-to-txt",
+  "name": "Folder to TXT",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Export a whole folder of notes as plain .txt files to anywhere on disk, mirroring the folder tree.",
+  "author": "the-vfp",
+  "authorUrl": "https://github.com/the-vfp",
+  "isDesktopOnly": true
+}
