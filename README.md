@@ -72,6 +72,11 @@ The conversion functions at the top of `main.js` (`removeFrontmatter`, `unwrapWi
 `flattenMarkdown`, `convert`) are pure and free of Obsidian imports, so they can be
 sliced out and tested in plain Node.
 
+## Credits
+
+Written with [Claude Code](https://claude.com/claude-code) — Claude wrote the
+implementation and the tests; the behaviour, defaults and review are mine.
+
 ## License
 
 MIT
