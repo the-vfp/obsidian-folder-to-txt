@@ -36,10 +36,12 @@ Set a destination first in **Settings → Folder to TXT → Output folder**.
 Then, any of:
 
 - Right-click a folder in the file explorer → **Export folder as .txt** or **Export index of folder**
+- Highlight several folders (ctrl/cmd-click), right-click → **Export N folders as .txt** or **Export index of N folders**
 - Right-click a note → **Export note as .txt**
 - Command palette → **Export a folder as .txt files** (opens a folder picker)
 - Command palette → **Export the whole vault as .txt files**
 - Command palette → **Export an index of a folder** / **Export an index of the whole vault**
+- Command palette → **Export an index of several folders…** / **Export several folders as .txt…** (tick-list picker)
 
 A folder export creates a subfolder at the destination named after the folder you
 exported, so separate exports never mix together. Single notes are written straight
@@ -59,9 +61,20 @@ An index is one markdown file containing a tree like this:
 │   └── Spark Plugin — Project Scope.md
 ```
 
+Several folders can go into one index. Highlight them in the explorer and right-click,
+or use the tick-list picker from the command palette — it remembers your last selection,
+so re-running the same set is two clicks. Each folder gets its own tree in the file, in
+the order you picked them. Selecting a folder together with one of its own ancestors
+collapses to the ancestor rather than listing that subtree twice.
+
 The gist is a note's frontmatter `description` (or `summary`/`subtitle`) if it has one,
 otherwise its first line of prose with markdown flattened out. Notes whose first line
-just repeats their own title are left bare rather than echoing it.
+just repeats their own title are left bare rather than echoing it, and a first line
+that's nothing but a bare URL is skipped in favour of the next real line.
+
+**The gist reads the first line of every note.** If a note opens with something you
+wouldn't paste into a chat window, it lands in the index. Turn off **Include a one-line
+gist** for a names-only index when that matters.
 
 By default the index goes to your clipboard *and* to `<folder> index.md` in the output
 folder; either half can be switched off. Tags, word counts and modified dates are

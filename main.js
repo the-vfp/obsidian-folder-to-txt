@@ -1,7 +1,7 @@
 'use strict';
 
 const obsidian = require('obsidian');
-const { Plugin, PluginSettingTab, Setting, Notice, FuzzySuggestModal, TFolder, TFile, getAllTags } = obsidian;
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, FuzzySuggestModal, TFolder, TFile, getAllTags } = obsidian;
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -25,6 +25,7 @@ const DEFAULT_SETTINGS = {
   indexIncludeNonMarkdown: false,
   indexSkipEmptyFolders: true,
   indexMaxDepth: 0, // 0 = no limit
+  indexFolderSelection: [], // remembered tick-list from the folder picker
   indexWriteFile: true,
   indexCopyToClipboard: true,
 };
@@ -185,7 +186,12 @@ function buildGist(raw, frontmatter, limit) {
   }
   if (!text) {
     const body = flattenMarkdown(unwrapWikilinks(removeFrontmatter(raw).slice(0, 4000), true));
-    const line = body.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
+    // A note that opens with a bare link gets a gist of truncated URL, which says nothing.
+    const isBareUrl = (l) => /^<?https?:\/\/\S+>?$/.test(l);
+    const line = body
+      .split('\n')
+      .map((l) => l.trim())
+      .find((l) => l.length > 0 && !isBareUrl(l));
     text = line || '';
   }
   if (!text) return '';
@@ -208,7 +214,17 @@ function formatDate(ms) {
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
 }
 
-async function buildIndex(app, folder, settings, onProgress) {
+// Selecting a folder and one of its own subfolders would list that subtree twice.
+function dedupeFolders(folders) {
+  const unique = folders.filter((f, i) => folders.indexOf(f) === i);
+  const root = unique.find((f) => f.isRoot());
+  if (root) return [root];
+  return unique.filter(
+    (f) => !unique.some((other) => other !== f && f.path.startsWith(other.path + '/'))
+  );
+}
+
+async function buildIndex(app, folders, settings, onProgress) {
   const lines = [];
   const stats = { notes: 0, folders: 0, hidden: 0, pruned: 0 };
   const memo = new Map();
@@ -283,9 +299,16 @@ async function buildIndex(app, folder, settings, onProgress) {
     }
   }
 
-  await walk(folder, '', 0);
+  const roots = dedupeFolders(folders);
+  const nameOf = (f) => (f.isRoot() ? app.vault.getName() : f.name);
 
-  const rootName = folder.isRoot() ? app.vault.getName() : folder.name;
+  for (let i = 0; i < roots.length; i++) {
+    if (i > 0) lines.push('');
+    stats.folders++;
+    lines.push(nameOf(roots[i]) + '/');
+    await walk(roots[i], '', 0);
+  }
+
   const summary = [
     stats.notes + ' file' + (stats.notes === 1 ? '' : 's'),
     stats.folders + ' folder' + (stats.folders === 1 ? '' : 's'),
@@ -294,19 +317,19 @@ async function buildIndex(app, folder, settings, onProgress) {
   if (stats.hidden) summary.splice(2, 0, stats.hidden + ' hidden by depth limit');
   if (stats.pruned) summary.splice(2, 0, stats.pruned + ' empty folders skipped');
 
-  const text = [
-    '# Index of ' + rootName,
+  const head = [
+    roots.length === 1
+      ? '# Index of ' + nameOf(roots[0])
+      : '# Index of ' + roots.length + ' folders',
     '',
-    summary.join(' · '),
-    '',
-    '```text',
-    rootName + '/',
-    ...lines,
-    '```',
-    '',
-  ].join('\n');
+  ];
+  if (roots.length > 1) {
+    head.push(roots.map((f) => (f.isRoot() ? '/' : f.path)).join(' · '), '');
+  }
 
-  return { text, stats };
+  const text = [...head, summary.join(' · '), '', '```text', ...lines, '```', ''].join('\n');
+
+  return { text, stats, roots };
 }
 
 async function copyToClipboard(text) {
@@ -345,6 +368,111 @@ class FolderSuggestModal extends FuzzySuggestModal {
   }
 }
 
+// Tick-list of folders, for picking several without hunting them down in the explorer.
+class MultiFolderModal extends Modal {
+  constructor(app, options) {
+    super(app);
+    this.options = options;
+    this.selected = new Set(options.initial || []);
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h3', { text: this.options.title });
+
+    const filter = contentEl.createEl('input', { type: 'text' });
+    filter.placeholder = 'Filter folders…';
+    filter.style.width = '100%';
+
+    const listEl = contentEl.createDiv();
+    listEl.style.maxHeight = '45vh';
+    listEl.style.overflowY = 'auto';
+    listEl.style.margin = '0.75em 0';
+
+    const footer = contentEl.createDiv();
+    footer.style.display = 'flex';
+    footer.style.alignItems = 'center';
+    footer.style.justifyContent = 'space-between';
+    footer.style.gap = '0.75em';
+    const count = footer.createEl('span');
+    count.style.color = 'var(--text-muted)';
+    const buttons = footer.createDiv();
+    buttons.style.display = 'flex';
+    buttons.style.gap = '0.5em';
+
+    const clear = buttons.createEl('button', { text: 'Clear' });
+    const confirm = buttons.createEl('button', { text: this.options.cta });
+    confirm.addClass('mod-cta');
+
+    const folders = this.app.vault
+      .getAllLoadedFiles()
+      .filter((f) => f instanceof TFolder && !f.isRoot())
+      .sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
+
+    const LIMIT = 400;
+    const updateCount = () => {
+      count.setText(this.selected.size + ' selected');
+      confirm.disabled = this.selected.size === 0;
+    };
+
+    const render = () => {
+      const needle = filter.value.trim().toLowerCase();
+      listEl.empty();
+      let shown = 0;
+      for (const folder of folders) {
+        if (needle && !folder.path.toLowerCase().includes(needle)) continue;
+        if (shown >= LIMIT) {
+          listEl.createEl('p', {
+            text: 'Showing the first ' + LIMIT + ' — narrow the filter to see the rest.',
+          }).style.color = 'var(--text-muted)';
+          break;
+        }
+        shown++;
+
+        const row = listEl.createEl('label');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.gap = '0.5em';
+        row.style.padding = '2px 0';
+        row.style.cursor = 'pointer';
+
+        const box = row.createEl('input', { type: 'checkbox' });
+        box.checked = this.selected.has(folder.path);
+        box.addEventListener('change', () => {
+          if (box.checked) this.selected.add(folder.path);
+          else this.selected.delete(folder.path);
+          updateCount();
+        });
+        row.createEl('span', { text: folder.path });
+      }
+      if (!shown) listEl.createEl('p', { text: 'No folders match that filter.' });
+    };
+
+    filter.addEventListener('input', render);
+    clear.addEventListener('click', () => {
+      this.selected.clear();
+      render();
+      updateCount();
+    });
+    confirm.addEventListener('click', () => {
+      const chosen = Array.from(this.selected)
+        .map((p) => this.app.vault.getAbstractFileByPath(p))
+        .filter((f) => f instanceof TFolder);
+      this.close();
+      this.options.onConfirm(chosen, Array.from(this.selected));
+    });
+
+    render();
+    updateCount();
+    window.setTimeout(() => filter.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 module.exports = class FolderToTxtPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -374,6 +502,18 @@ module.exports = class FolderToTxtPlugin extends Plugin {
       callback: () => this.exportIndex(this.app.vault.getRoot()),
     });
 
+    this.addCommand({
+      id: 'export-index-of-chosen-folders',
+      name: 'Export an index of several folders…',
+      callback: () => this.pickFolders('Index these folders', 'Export index', (f) => this.exportIndex(f)),
+    });
+
+    this.addCommand({
+      id: 'export-chosen-folders-as-txt',
+      name: 'Export several folders as .txt files…',
+      callback: () => this.pickFolders('Export these folders', 'Export as .txt', (f) => this.exportFolders(f)),
+    });
+
     this.registerEvent(
       this.app.workspace.on('file-menu', (menu, file) => {
         if (file instanceof TFolder) {
@@ -401,6 +541,39 @@ module.exports = class FolderToTxtPlugin extends Plugin {
         }
       })
     );
+
+    // Fires when several items are highlighted in the explorer at once.
+    this.registerEvent(
+      this.app.workspace.on('files-menu', (menu, files) => {
+        const folders = files.filter((f) => f instanceof TFolder);
+        if (folders.length < 2) return;
+        menu.addItem((item) =>
+          item
+            .setTitle('Export ' + folders.length + ' folders as .txt')
+            .setIcon('file-text')
+            .onClick(() => this.exportFolders(folders))
+        );
+        menu.addItem((item) =>
+          item
+            .setTitle('Export index of ' + folders.length + ' folders')
+            .setIcon('list-tree')
+            .onClick(() => this.exportIndex(folders))
+        );
+      })
+    );
+  }
+
+  pickFolders(title, cta, run) {
+    new MultiFolderModal(this.app, {
+      title,
+      cta,
+      initial: this.settings.indexFolderSelection,
+      onConfirm: async (folders, paths) => {
+        this.settings.indexFolderSelection = paths;
+        await this.saveSettings();
+        run(folders);
+      },
+    }).open();
   }
 
   async saveSettings() {
@@ -413,9 +586,52 @@ module.exports = class FolderToTxtPlugin extends Plugin {
     await this.exportFiles(files, folder, label);
   }
 
-  async exportIndex(folder) {
-    const settings = this.settings;
+  async exportFolders(input) {
+    const picked = (Array.isArray(input) ? input : [input]).filter((f) => f instanceof TFolder);
+    if (!picked.length) {
+      new Notice('Folder to TXT: no folders selected.');
+      return;
+    }
+    if (!this.settings.outputPath) {
+      new Notice('Folder to TXT: set an output folder in the plugin settings first.', 8000);
+      return;
+    }
 
+    const folders = dedupeFolders(picked);
+    if (folders.length === 1) return this.exportFolder(folders[0]);
+
+    const notice = new Notice('Exporting ' + folders.length + ' folders…', 0);
+    let written = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (let i = 0; i < folders.length; i++) {
+      notice.setMessage('Exporting ' + folders[i].name + ' (' + (i + 1) + '/' + folders.length + ')…');
+      const result = await this.exportFiles(collectMarkdown(folders[i], []), folders[i], folders[i].name, true);
+      if (!result) break; // the output path went away mid-run; exportFiles has already said so
+      written += result.written;
+      skipped += result.skipped;
+      failed += result.errors.length;
+    }
+
+    notice.hide();
+
+    let summary =
+      'Exported ' + written + ' note' + (written === 1 ? '' : 's') +
+      ' from ' + folders.length + ' folders to ' + this.settings.outputPath;
+    if (skipped) summary += '\nSkipped ' + skipped + ' existing file' + (skipped === 1 ? '' : 's');
+    if (failed) summary += '\n' + failed + ' failed — see the developer console';
+    new Notice(summary, 12000);
+  }
+
+  async exportIndex(input) {
+    const settings = this.settings;
+    const folders = (Array.isArray(input) ? input : [input]).filter((f) => f instanceof TFolder);
+
+    if (!folders.length) {
+      new Notice('Folder to TXT: no folders selected.');
+      return;
+    }
     if (!settings.indexWriteFile && !settings.indexCopyToClipboard) {
       new Notice('Folder to TXT: the index has nowhere to go — enable the file or the clipboard in settings.', 9000);
       return;
@@ -428,7 +644,7 @@ module.exports = class FolderToTxtPlugin extends Plugin {
     const notice = new Notice('Building index…', 0);
     let result;
     try {
-      result = await buildIndex(this.app, folder, settings, (n) =>
+      result = await buildIndex(this.app, folders, settings, (n) =>
         notice.setMessage('Building index… ' + n + ' files')
       );
     } catch (err) {
@@ -442,7 +658,8 @@ module.exports = class FolderToTxtPlugin extends Plugin {
     const done = [];
 
     if (settings.indexWriteFile) {
-      const label = folder.isRoot() ? this.app.vault.getName() : folder.name;
+      const names = result.roots.map((f) => (f.isRoot() ? this.app.vault.getName() : f.name));
+      const label = names.length <= 3 ? names.join(' + ') : names.length + ' folders';
       const target = path.join(settings.outputPath, safeSegment(label + ' index') + '.md');
       try {
         await fsp.mkdir(settings.outputPath, { recursive: true });
@@ -469,16 +686,17 @@ module.exports = class FolderToTxtPlugin extends Plugin {
 
   // `base` is the vault folder that becomes the root of the mirrored tree.
   // `label` names the subfolder to create under the output path; null writes straight into it.
-  async exportFiles(files, base, label) {
+  // `quiet` suppresses the per-folder summary so a batch can report once at the end.
+  async exportFiles(files, base, label, quiet) {
     const settings = this.settings;
 
     if (!settings.outputPath) {
       new Notice('Folder to TXT: set an output folder in the plugin settings first.', 8000);
-      return;
+      return null;
     }
     if (!files.length) {
-      new Notice('Folder to TXT: no markdown notes found there.');
-      return;
+      if (!quiet) new Notice('Folder to TXT: no markdown notes found there.');
+      return { written: 0, skipped: 0, errors: [] };
     }
 
     const destRoot = label ? path.join(settings.outputPath, safeSegment(label)) : settings.outputPath;
@@ -487,7 +705,7 @@ module.exports = class FolderToTxtPlugin extends Plugin {
     } catch (err) {
       new Notice('Folder to TXT: could not create ' + destRoot + '\n' + err.message, 10000);
       console.error('[folder-to-txt]', err);
-      return;
+      return null;
     }
 
     const basePrefix = base.isRoot() ? '' : base.path + '/';
@@ -534,10 +752,14 @@ module.exports = class FolderToTxtPlugin extends Plugin {
 
     notice.hide();
 
-    let summary = 'Exported ' + written + ' note' + (written === 1 ? '' : 's') + ' to ' + destRoot;
-    if (skipped) summary += '\nSkipped ' + skipped + ' existing file' + (skipped === 1 ? '' : 's');
-    if (errors.length) summary += '\n' + errors.length + ' failed \u2014 see the developer console';
-    new Notice(summary, 12000);
+    if (!quiet) {
+      let summary = 'Exported ' + written + ' note' + (written === 1 ? '' : 's') + ' to ' + destRoot;
+      if (skipped) summary += '\nSkipped ' + skipped + ' existing file' + (skipped === 1 ? '' : 's');
+      if (errors.length) summary += '\n' + errors.length + ' failed \u2014 see the developer console';
+      new Notice(summary, 12000);
+    }
+
+    return { written, skipped, errors };
   }
 };
 
